@@ -26,6 +26,11 @@ class Fragment:
     src_end: int
     dest_start: int
     dest_end: int
+    # 块内仿射逆映射参数：src = back_a * dest + back_b（back_a ∈ {+1, -1}）。
+    # 每个片段都落在单个对齐块内，因此目标侧子区间可以精确回溯到源坐标；
+    # 双段串联迁移靠它把第二段命中的中间子区间折算回原 BED 源坐标。
+    back_a: int = 1
+    back_b: int = 0
 
 
 @dataclass
@@ -36,6 +41,9 @@ class Candidate:
     fragments: list[Fragment]
     covered: int
     total: int
+    # 内部 prepared chain 的稳定标识（同一 chain 多次命中间隔不变），
+    # 双段串联时用于把不同中间片段命中同一条 chain 的片段归入同一路径。
+    chain_uid: int = 0
 
 
 @dataclass
@@ -149,6 +157,7 @@ class _PreparedChain:
                 if nb.same_orientation:
                     delta = nb.d_lo - nb.s_start
                     d_start, d_end = ovl_lo + delta, ovl_hi + delta
+                    back_a, back_b = 1, nb.s_start - nb.d_lo
                 else:
                     # 反向：归一化前存储帧 dst_stored = d_bstart + (src - s_bstart)，
                     # 归一化后 dst = d_hi + s_start - src。
@@ -156,12 +165,15 @@ class _PreparedChain:
                     pivot = nb.d_hi + nb.s_start
                     d_start = pivot - ovl_hi
                     d_end = pivot - ovl_lo
+                    back_a, back_b = -1, pivot
                 frags.append(
                     Fragment(
                         src_start=ovl_lo,
                         src_end=ovl_hi,
                         dest_start=d_start,
                         dest_end=d_end,
+                        back_a=back_a,
+                        back_b=back_b,
                     )
                 )
             i += 1
@@ -180,23 +192,22 @@ class LiftOverEngine:
         for lst in self._index.values():
             lst.sort(key=lambda p: (p.s_lo, p.chain_id))
 
-    def convert(self, rec: BedRecord) -> RowResult:
-        row = RowResult(
-            line_no=rec.line_no,
-            src_chrom=rec.chrom,
-            src_start=rec.start,
-            src_end=rec.end,
-            raw=rec.raw,
-            status="unmapped",
-        )
-        length = rec.end - rec.start
-        chains_here = self._index.get(rec.chrom, [])
-        candidates: list[Candidate] = []
+    def has_chrom(self, chrom: str) -> bool:
+        """源侧是否存在该染色体（区分“无此染色体”与“落在缺口/未覆盖区”）。"""
+        return chrom in self._index
 
-        for pc in chains_here:
-            if pc.s_hi <= rec.start or pc.s_lo >= rec.end:
+    def candidates_for(self, chrom: str, start: int, end: int) -> list[Candidate]:
+        """对任意源侧区间给出全部命中候选，不做状态判定。
+
+        单段 ``convert`` 与双段串联引擎共用同一套命中逻辑，保证行为一致；
+        命中多个 chain 时全部返回，由调用方决定如何标记歧义。
+        """
+        length = end - start
+        candidates: list[Candidate] = []
+        for pc in self._index.get(chrom, []):
+            if pc.s_hi <= start or pc.s_lo >= end:
                 continue
-            frags = pc.map_interval(rec.start, rec.end)
+            frags = pc.map_interval(start, end)
             if not frags:
                 continue
             covered = sum(f.src_end - f.src_start for f in frags)
@@ -208,11 +219,25 @@ class LiftOverEngine:
                     fragments=frags,
                     covered=covered,
                     total=length,
+                    chain_uid=id(pc),
                 )
             )
+        return candidates
+
+    def convert(self, rec: BedRecord) -> RowResult:
+        row = RowResult(
+            line_no=rec.line_no,
+            src_chrom=rec.chrom,
+            src_start=rec.start,
+            src_end=rec.end,
+            raw=rec.raw,
+            status="unmapped",
+        )
+        length = rec.end - rec.start
+        candidates = self.candidates_for(rec.chrom, rec.start, rec.end)
 
         if not candidates:
-            if not chains_here:
+            if not self.has_chrom(rec.chrom):
                 row.reason = f"染色体 {rec.chrom} 在 chain 文件的源侧不存在"
             else:
                 row.reason = (

@@ -3,7 +3,11 @@
 供实验室**内网/离线环境**使用的基因组坐标区间迁移工具。用户在浏览器中
 上传 BED 文件与对应的 UCSC `chain` 文件，指定 BED 区间属于链的
 **target 侧**还是**query 侧**，先在页面上逐条预览转换状态，确认后再
-下载 TSV 结果。
+下载 TSV 结果。支持两种模式：
+
+- **单段**：一份 chain 的常规迁移；
+- **双段**：同一 BED 依次经过**两份 chain** 迁移（如 hg19→hg38→T2T），
+  第二段只处理第一段实际映射到的片段，最终片段精确回溯到原 BED 源坐标。
 
 - 后端：Python 3.11+ / FastAPI / Uvicorn
 - 前端：原生 HTML + CSS + JavaScript（无任何 CDN / 外网依赖）
@@ -22,12 +26,13 @@
     ├── app/                  # 后端
     │   ├── bed.py            # BED 解析（零基左闭右开，错误带行号）
     │   ├── chain.py          # UCSC chain 解析（严格校验，错误带行号）
-    │   ├── engine.py         # 区间转换引擎（缺口拆分 / 歧义 / 负链）
-    │   ├── report.py         # 原始 / 裁决版 TSV 导出与预览 JSON
+    │   ├── engine.py         # 单段区间转换引擎（缺口拆分 / 歧义 / 负链）
+    │   ├── engine2.py        # 双段串联引擎（路径 / 回溯 / 失败阶段）
+    │   ├── report.py         # 单段与双段 TSV 导出、预览 JSON
     │   └── main.py           # FastAPI 入口（含歧义人工裁决接口）
     ├── static/               # 前端（纯本地资源）
-    ├── examples/             # 可直接试用的 BED / chain 示例
-    ├── tests/                # pytest 测试（46 个用例）
+    ├── examples/             # 可直接试用的 BED / chain 示例（含双段示例）
+    ├── tests/                # pytest 测试（73 个用例）
     ├── scripts/init.sh       # 本地开发依赖初始化
     ├── Dockerfile            # 方式 B 构建入口：以本目录为上下文
     ├── docker-compose.yml    # 两种启动方式共用
@@ -158,17 +163,49 @@ bash scripts/init.sh
 
 ## 三、使用方法
 
-1. 选择 BED 文件（至少前 3 列 `chrom start end`，坐标为**零基左闭右开**，
+### 单段转换
+
+1. 转换模式选择「单段（一份 chain）」。
+2. 选择 BED 文件（至少前 3 列 `chrom start end`，坐标为**零基左闭右开**，
    支持第 4 列起的额外列但不参与转换；允许 `#`、`browser`、`track` 行）。
-2. 选择对应的 UCSC `chain` 文件。
-3. 选择 BED 区间位于 chain 的哪一侧：
+3. 选择对应的 UCSC `chain` 文件。
+4. 选择 BED 区间位于 chain 的哪一侧：
    - **target 侧**：target → query；
    - **query 侧**：query → target。
-4. 点击「校验并转换」。页面显示每条源区间的状态。
-5. 若存在**歧义**行，可先在页面上按 BED 物理行号逐行**人工裁决**
+5. 点击「校验并转换」。页面显示每条源区间的状态。
+6. 若存在**歧义**行，可先在页面上按 BED 物理行号逐行**人工裁决**
    （见下一节），也可以直接下载。
-6. 点击「下载原始结果 TSV」获取未改动的原始结果；对歧义行做过裁决后，
+7. 点击「下载原始结果 TSV」获取未改动的原始结果；对歧义行做过裁决后，
    可点击「下载裁决版 TSV」获取只保留所选候选的裁决版。
+
+### 双段转换（两份 chain 依次迁移）
+
+1. 转换模式选择「双段（同一 BED 依次经过两份 chain）」。
+2. 选择 BED 文件，再**按顺序**选择 chain 文件 1（第一段）与
+   chain 文件 2（第二段），并分别指定每段的源侧：
+   - `side1`：BED 区间属于 chain 文件 1 的哪一侧；
+   - `side2`：第一段产物（中间坐标）属于 chain 文件 2 的哪一侧。
+3. 点击「校验并转换」。语义规则：
+
+   - 第一段把源区间迁到中间坐标系；**第二段只处理第一段实际映射到的
+     片段**（第一段未覆盖的部分不参与第二段）；
+   - 每个最终片段都按映射方向**回溯到原 BED 源坐标**（零基左闭右开），
+     预览与 TSV 中同时给出源、中间、最终三套坐标；
+   - 每条结果标明**两段 chain ID、路径序号与每段覆盖情况**
+     （`seg1_covered` / `seg2_covered` / `total_len`）；
+   - 任一段的缺口都会留下**源区间未覆盖信息**（`uncovered_src` 列），
+     残余片段只会标为 `partial`，**绝不**标成完全映射；
+   - 多条可达路径（第一段 chain × 第二段 chain 的组合）**全部保留为
+     歧义**，不自动选择、不合并；在第二段走不通的第一段命中不构成
+     可达路径，只在说明中注明；
+   - 没有任何最终映射的源行仍保留**原物理行号**与**失败阶段**
+     （`failed_stage` = `segment1` / `segment2`）；第二段找不到中间
+     染色体同样按第二段无映射处理；
+   - BED、chain 文件 1、chain 文件 2 中**任一**文件有格式错误，都会
+     带行号列出并拒绝整次转换，不产生任何下载结果。
+
+4. 歧义行的裁决与单段相同（按路径序号选择），下载按钮、
+   原始/裁决版 TSV 的用法完全一致。
 
 ### 歧义区间人工裁决
 
@@ -189,10 +226,10 @@ bash scripts/init.sh
 
 | 状态 | 含义 |
 | --- | --- |
-| 完全映射 `mapped` | 区间全部落在对齐块内 |
+| 完全映射 `mapped` | 区间全部落在对齐块内（双段：全部源碱基经唯一可达路径完成两段迁移） |
 | 部分映射 `partial` | 一部分落在链内缺口/未对齐区域；命中部分被拆成**按源坐标有序的片段**，未映射部分丢弃 |
-| 歧义 `ambiguous` | 同一源区间命中**多个 chain / 多个目标位置**；系统列出全部候选，**绝不自动挑选**，需人工逐行裁决后再用于下游分析 |
-| 无映射 `unmapped` | 没有任何碱基可映射；结果中保留源行号、源区间与原因 |
+| 歧义 `ambiguous` | 同一源区间命中**多个 chain / 多个目标位置**（双段：多条可达路径）；系统列出全部候选，**绝不自动挑选**，需人工逐行裁决后再用于下游分析 |
+| 无映射 `unmapped` | 没有任何碱基可映射；结果中保留源行号、源区间与原因（双段另附 `failed_stage` 标明失败发生在第一段还是第二段） |
 
 ### 坐标与负链
 
@@ -230,12 +267,40 @@ fragment_index, src_start, src_end, dest_start, dest_end, reason
 `ambiguous`，`partial` 也不会因为人工选择而变成 `mapped`。
 文件名形如 `liftover_target_to_query_<时间戳>.adjudicated.v<版本>.tsv`。
 
+**双段结果**（`POST /api/liftover2` 产生）列：
+
+```
+source_line, status, failed_stage, source_chrom, source_start, source_end,
+path_index, chain1_id, chain2_id, mid_chrom, mid_strand,
+dest_chrom, dest_strand, fragment_index,
+src_start, src_end, mid_start, mid_end, dest_start, dest_end,
+seg1_covered, seg2_covered, total_len, uncovered_src, reason
+```
+
+- `src_start`/`src_end` 是**回溯到原 BED 的源坐标**；`mid_*` 是中间坐标
+  （第一段目标 = 第二段源）；`dest_*` 是最终坐标；
+- `path_index` 为 1 基路径序号，`chain1_id`/`chain2_id` 是两段各自
+  命中的 chain ID；`seg1_covered`/`seg2_covered`/`total_len` 给出该路径
+  每段覆盖的碱基数与源区间总长；
+- `uncovered_src` 列出该路径未覆盖的源子区间（如 `[100,120);[300,320)`），
+  完全覆盖时为 `.`；
+- `failed_stage` 仅对 `unmapped` 行有意义：`segment1`（第一段无映射）
+  或 `segment2`（第二段无映射，含中间染色体在 chain 文件 2 中不存在），
+  其余行写 `.`；无映射行的路径/片段列写 `.`，`uncovered_src` 为整个
+  源区间，`seg1_covered`/`seg2_covered` 为行级覆盖（第一段各 chain 的
+  并集 / 恒为 0）；
+- 裁决版同样在末尾追加 `decision` 列（`已裁决`/`未裁决`/`.`），
+  `candidate_index` 即路径序号，规则与单段一致。
+
 ### 失败即阻止导出
 
 - BED 坏行（列数不足、坐标非整数、`start >= end` 等）或 chain 格式错误
   （头列数/字段非法、块越界、缺少终止行、gap 越界等）都会在页面上
   **带行号列出全部问题**，接口返回 400，且**不会生成或保留任何可下载
   文件**；修正后需重新提交。
+- 双段模式下 BED、chain 文件 1、chain 文件 2 任一文件出错同样整体
+  拒绝，错误分别以 `BED 第 N 行`、`chain 文件 1：…`、`chain 文件 2：…`
+  标明来源。
 
 ---
 
@@ -289,6 +354,69 @@ curl -s -X POST http://localhost:8080/api/liftover \
 ```json
 {"errors": ["BED 第 3 行：……", "……"]}
 ```
+
+### 双段转换（两份 chain 依次迁移）
+
+`POST /api/liftover2`，`multipart/form-data`，字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `bed` | 文件 | BED 文件（零基左闭右开） |
+| `chain1` | 文件 | 第一段 UCSC chain 文件 |
+| `chain2` | 文件 | 第二段 UCSC chain 文件 |
+| `side1` | 文本 | BED 区间属于 chain 文件 1 的哪一侧（`target`/`query`） |
+| `side2` | 文本 | 第一段产物属于 chain 文件 2 的哪一侧（`target`/`query`） |
+
+```bash
+curl -s -X POST http://localhost:8080/api/liftover2 \
+  -F "bed=@liftover-web/examples/example_double.bed" \
+  -F "chain1=@liftover-web/examples/demo_seg1.chain" \
+  -F "chain2=@liftover-web/examples/demo_seg2.chain" \
+  -F "side1=target" -F "side2=target"
+```
+
+成功（200）返回预览与下载令牌（`kind` 为 `double`；单段接口返回
+`single`）：
+
+```json
+{
+  "download_token": "……",
+  "download_name": "liftover_double_target-target_20261005-120000.tsv",
+  "kind": "double",
+  "preview": {
+    "total": 8,
+    "counts": {"mapped": 1, "partial": 2, "ambiguous": 1, "unmapped": 4},
+    "rows": [
+      {
+        "line_no": 6, "status": "ambiguous", "failed_stage": "",
+        "src_chrom": "chr1", "src_start": 300, "src_end": 400,
+        "candidates": [
+          {"path_index": 1, "chain1_id": "2", "chain2_id": "11",
+           "mid_chrom": "chrB", "mid_strand": "-",
+           "dest_chrom": "chrW", "dest_strand": "-",
+           "seg1_covered": 100, "seg2_covered": 100, "total": 100,
+           "uncovered_src": [],
+           "fragments": [
+             {"src_start": 300, "src_end": 400,
+              "mid_start": 300, "mid_end": 400,
+              "dest_start": 0, "dest_end": 100}
+           ]}
+        ]
+      }
+    ]
+  }
+}
+```
+
+- 预览行中 `candidates` 即**可达路径**（含两段 chain ID、路径序号、
+  每段覆盖与未覆盖源区间）；`failed_stage` 标明无映射行的失败阶段；
+- BED、chain 文件 1、chain 文件 2 任一解析失败都返回 400，错误分别
+  以 `BED 第 N 行`、`chain 文件 1：…`、`chain 文件 2：…` 开头，整次
+  转换被拒绝，不产生任何下载令牌；
+- 下载、裁决接口与单段完全共用：`GET /api/download/{token}` 下载双段
+  原始 TSV（25 列），`GET/POST /api/result/{token}/decisions` 按路径
+  序号裁决，`GET /api/download/{token}/adjudicated` 下载裁决版
+  （26 列）。
 
 ### 下载结果 TSV
 
@@ -403,6 +531,40 @@ curl -OJ "http://localhost:8080/api/download/${TOKEN}/adjudicated"
 歧义行（示例 BED 第 11 行 `chr1 320 360`，候选 1=chrA、候选 2=chrB）
 可直接在预览页裁决，或用上面的 `POST /api/result/{token}/decisions`
 接口按物理行号选定 / 撤销，再下载 `…/adjudicated` 裁决版 TSV。
+
+### 双段快速试用
+
+```bash
+# 页面上选择「双段」模式，然后：
+#   BED:        examples/example_double.bed
+#   chain 文件 1: examples/demo_seg1.chain   （chr1 → chrA/chrB/chrM）
+#   chain 文件 2: examples/demo_seg2.chain   （chrA → chrZ；chrB → chrW/chrV）
+#   side1/side2: 均为 target
+```
+
+或用 API：
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8080/api/liftover2 \
+  -F "bed=@liftover-web/examples/example_double.bed" \
+  -F "chain1=@liftover-web/examples/demo_seg1.chain" \
+  -F "chain2=@liftover-web/examples/demo_seg2.chain" \
+  -F "side1=target" -F "side2=target" | python3 -c "import json,sys; print(json.load(sys.stdin)['download_token'])")
+
+# 下载双段原始 TSV（25 列，含两段 chain ID、路径序号、每段覆盖与未覆盖源区间）
+curl -OJ "http://localhost:8080/api/download/${TOKEN}"
+
+# 歧义行（BED 第 6 行，路径 1=chrW、路径 2=chrV）选定路径 2 后下载裁决版
+curl -s -X POST "http://localhost:8080/api/result/${TOKEN}/decisions" \
+  -H 'Content-Type: application/json' \
+  -d '{"version":0,"source_line":6,"candidate_index":2}'
+curl -OJ "http://localhost:8080/api/download/${TOKEN}/adjudicated"
+```
+
+该示例 8 行数据覆盖：完全映射（行 3）、第二段缺口导致的部分映射
+（行 4）、第一段+第二段缺口叠加的部分映射（行 5）、双路径歧义
+（行 6）、第二段无映射（行 7 中间染色体不存在、行 8 落在对齐范围外）、
+第一段无映射（行 9 范围外、行 10 无此染色体）。
 
 ---
 

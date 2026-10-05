@@ -3,6 +3,10 @@
 结果只在校验完全通过后保存在进程内存中（BytesIO 等价物），
 任何解析错误都直接 400 返回，不创建、更不提供任何可下载文件。
 
+- ``POST /api/liftover``：单段转换（一份 chain）；
+- ``POST /api/liftover2``：双段转换（同一 BED 依次经过两份 chain，
+  第二段只处理第一段实际映射到的片段，最终片段回溯到原 BED 源坐标）。
+
 歧义裁决只作用于某一次转换结果（token 标识），绝不回写原始转换：
 
 - 原始结果 ``GET /api/download/{token}`` 的字节内容在裁决前后完全一致；
@@ -27,7 +31,14 @@ from .bed import parse_bed
 from .chain import parse_chain
 from .engine import RowResult
 from .engine import LiftOverEngine
-from .report import build_adjudicated_tsv, build_tsv, rows_to_preview
+from .engine2 import TwoSegmentEngine
+from .report import (
+    build_adjudicated_tsv,
+    build_adjudicated_tsv2,
+    build_tsv,
+    build_tsv2,
+    rows_to_preview,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "..", "static")
@@ -36,15 +47,16 @@ MAX_UPLOAD_BYTES = int(os.getenv("LIFTOVER_MAX_UPLOAD_MB", "50")) * 1024 * 1024
 JOB_TTL_SECONDS = int(os.getenv("LIFTOVER_JOB_TTL_SECONDS", "3600"))
 MAX_JOBS = int(os.getenv("LIFTOVER_MAX_JOBS", "100"))
 
-app = FastAPI(title="离线基因组区间迁移 (BED liftover)", version="1.1.0")
+app = FastAPI(title="离线基因组区间迁移 (BED liftover)", version="1.2.0")
 
 
 @dataclass
 class _Job:
-    rows: list[RowResult]
-    tsv_bytes: bytes               # 原始结果（永不改变）
+    rows: list                   # 单段 RowResult 列表或双段 RowResult2 列表
+    tsv_bytes: bytes             # 原始结果（永不改变）
     filename: str
     created_at: float
+    kind: str = "single"         # single / double
     # 裁决状态：{源物理行号: 1 基候选序号}；撤销即删除键
     decisions: dict[int, int] = field(default_factory=dict)
     version: int = 0               # 每次成功修改递增
@@ -135,7 +147,74 @@ async def liftover(
         rows=rows, tsv_bytes=payload, filename=filename, created_at=time.time(),
     )
 
-    return {"download_token": token, "download_name": filename, "preview": preview}
+    return {
+        "download_token": token,
+        "download_name": filename,
+        "kind": "single",
+        "preview": preview,
+    }
+
+
+@app.post("/api/liftover2")
+async def liftover2(
+    bed: UploadFile = File(...),
+    chain1: UploadFile = File(...),
+    chain2: UploadFile = File(...),
+    side1: str = Form(...),
+    side2: str = Form(...),
+):
+    """双段转换：同一 BED 依次经过 chain 文件 1 与 chain 文件 2。
+
+    第二段只处理第一段实际映射到的中间片段；最终片段回溯到原 BED 源
+    坐标。任一文件（BED / chain1 / chain2）有格式错误都带行号整体拒绝，
+    不生成任何可下载结果。
+    """
+    side_errors = [
+        f"{name} 必须是 target 或 query"
+        for name, val in (("side1", side1), ("side2", side2))
+        if val not in ("target", "query")
+    ]
+    if side_errors:
+        raise HTTPException(status_code=400, detail={"errors": side_errors})
+
+    bed_text = _read_upload(bed)
+    chain1_text = _read_upload(chain1)
+    chain2_text = _read_upload(chain2)
+
+    bed_result = parse_bed(bed_text)
+    chain1_result = parse_chain(chain1_text)
+    chain2_result = parse_chain(chain2_text)
+
+    errors = list(bed_result.errors)
+    errors += [f"chain 文件 1：{e}" for e in chain1_result.errors]
+    errors += [f"chain 文件 2：{e}" for e in chain2_result.errors]
+    if errors:
+        # 校验失败：只返回错误，绝不写入 _jobs —— 不存在可下载文件
+        raise HTTPException(status_code=400, detail={"errors": errors})
+
+    engine = TwoSegmentEngine(
+        chain1_result.chains, side1, chain2_result.chains, side2
+    )
+    rows = engine.convert_all(bed_result.records)
+    preview = rows_to_preview(rows)
+
+    tsv = build_tsv2(rows)
+    payload = b"\xef\xbb\xbf" + tsv.encode("utf-8")
+    token = secrets.token_urlsafe(24)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    filename = f"liftover_double_{side1}-{side2}_{stamp}.tsv"
+    _prune_jobs()
+    _jobs[token] = _Job(
+        rows=rows, tsv_bytes=payload, filename=filename,
+        created_at=time.time(), kind="double",
+    )
+
+    return {
+        "download_token": token,
+        "download_name": filename,
+        "kind": "double",
+        "preview": preview,
+    }
 
 
 def _get_job_or_404(token: str) -> _Job:
@@ -302,11 +381,15 @@ def _adjudicated_name(filename: str, version: int) -> str:
 async def download_adjudicated(token: str) -> Response:
     """下载裁决版 TSV。
 
-    已选歧义行仅输出被选候选的全部片段；未选歧义行输出全部候选并标明
-    “未裁决”；其他状态行照原结果输出。原始 status 列保持不变。
+    已选歧义行仅输出被选候选（双段为被选路径）的全部片段；未选歧义行
+    输出全部候选并标明“未裁决”；其他状态行照原结果输出。原始 status
+    列保持不变。
     """
     job = _get_job_or_404(token)
-    text = build_adjudicated_tsv(job.rows, job.decisions)
+    if job.kind == "double":
+        text = build_adjudicated_tsv2(job.rows, job.decisions)
+    else:
+        text = build_adjudicated_tsv(job.rows, job.decisions)
     payload = b"\xef\xbb\xbf" + text.encode("utf-8")
     filename = _adjudicated_name(job.filename, job.version)
     return Response(
