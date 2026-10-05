@@ -28,6 +28,32 @@ class Fragment:
     dest_end: int
 
 
+@dataclass(frozen=True)
+class _TracedFragment:
+    """带仿射参数的片段：可把目标侧子区间精确反映射回源侧坐标。
+
+    双段迁移用：第一段映射产生的中间片段，第二段只命中其某个子区间时，
+    需要把该子区间按映射方向回溯到原 BED 源坐标。
+    """
+
+    src_start: int
+    src_end: int
+    dest_start: int
+    dest_end: int
+    same_orientation: bool
+    delta: int = 0               # 同向：dest = src + delta
+    pivot: int = 0               # 反向：dest = pivot - src
+
+    def to_public(self) -> Fragment:
+        return Fragment(self.src_start, self.src_end, self.dest_start, self.dest_end)
+
+    def invert_dest(self, d_lo: int, d_hi: int) -> tuple[int, int]:
+        """把目标侧子区间 [d_lo, d_hi) 反映射为源侧区间（零基左闭右开）。"""
+        if self.same_orientation:
+            return d_lo - self.delta, d_hi - self.delta
+        return self.pivot - d_hi, self.pivot - d_lo
+
+
 @dataclass
 class Candidate:
     chain_id: str
@@ -124,15 +150,15 @@ class _PreparedChain:
             starts=tuple(nb.s_start for nb in norms),
         )
 
-    def map_interval(self, start: int, end: int) -> list[Fragment]:
-        """把源区间与对齐块求交并映射。
+    def map_interval_traced(self, start: int, end: int) -> list[_TracedFragment]:
+        """把源区间与对齐块求交并映射，返回带仿射参数的片段。
 
         块已统一到两侧正向帧。源与目标相对方向为同向时块内是平移；
         反向时块内镜像：``dest = d_hi + s_start - src``。
         无论哪种情况，返回片段的目标坐标都满足 d_start < d_end
         （零基左闭右开）。
         """
-        frags: list[Fragment] = []
+        frags: list[_TracedFragment] = []
         # 块按源坐标有序且互不相交。起点 <= start 的最后一块可能跨过 start；
         # 若它在 start 前已结束，则起点等于 start 的块（在下一个位置）才是
         # 第一候选块。
@@ -149,6 +175,10 @@ class _PreparedChain:
                 if nb.same_orientation:
                     delta = nb.d_lo - nb.s_start
                     d_start, d_end = ovl_lo + delta, ovl_hi + delta
+                    frags.append(
+                        _TracedFragment(ovl_lo, ovl_hi, d_start, d_end,
+                                        True, delta, 0)
+                    )
                 else:
                     # 反向：归一化前存储帧 dst_stored = d_bstart + (src - s_bstart)，
                     # 归一化后 dst = d_hi + s_start - src。
@@ -156,19 +186,30 @@ class _PreparedChain:
                     pivot = nb.d_hi + nb.s_start
                     d_start = pivot - ovl_hi
                     d_end = pivot - ovl_lo
-                frags.append(
-                    Fragment(
-                        src_start=ovl_lo,
-                        src_end=ovl_hi,
-                        dest_start=d_start,
-                        dest_end=d_end,
+                    frags.append(
+                        _TracedFragment(ovl_lo, ovl_hi, d_start, d_end,
+                                        False, 0, pivot)
                     )
-                )
             i += 1
         return frags
 
+    def map_interval(self, start: int, end: int) -> list[Fragment]:
+        """与 ``map_interval_traced`` 相同的映射，只保留公开坐标。"""
+        return [f.to_public() for f in self.map_interval_traced(start, end)]
 
-class LiftOverEngine:
+
+@dataclass
+class _SegCandidate:
+    """一段迁移的单个 chain 命中（内部使用，带可回溯片段）。"""
+
+    pc: _PreparedChain
+    fragments: list[_TracedFragment]
+    covered: int
+
+
+class _SegmentIndex:
+    """一份 chain 文件在指定源侧上的区间映射索引（单段/双段引擎共用）。"""
+
     def __init__(self, chains: list[Chain], side: str) -> None:
         if side not in ("target", "query"):
             raise ValueError("side 必须是 'target' 或 'query'")
@@ -180,6 +221,33 @@ class LiftOverEngine:
         for lst in self._index.values():
             lst.sort(key=lambda p: (p.s_lo, p.chain_id))
 
+    def candidates_for(
+        self, chrom: str, start: int, end: int
+    ) -> tuple[list[_SegCandidate], bool]:
+        """返回 (命中候选列表, 源染色体是否存在于该段 chain 源侧)。"""
+        chains_here = self._index.get(chrom, [])
+        hits: list[_SegCandidate] = []
+        for pc in chains_here:
+            if pc.s_hi <= start or pc.s_lo >= end:
+                continue
+            frags = pc.map_interval_traced(start, end)
+            if not frags:
+                continue
+            hits.append(
+                _SegCandidate(
+                    pc=pc,
+                    fragments=frags,
+                    covered=sum(f.src_end - f.src_start for f in frags),
+                )
+            )
+        return hits, bool(chains_here)
+
+
+class LiftOverEngine:
+    def __init__(self, chains: list[Chain], side: str) -> None:
+        self._seg = _SegmentIndex(chains, side)
+        self.side = self._seg.side
+
     def convert(self, rec: BedRecord) -> RowResult:
         row = RowResult(
             line_no=rec.line_no,
@@ -190,29 +258,21 @@ class LiftOverEngine:
             status="unmapped",
         )
         length = rec.end - rec.start
-        chains_here = self._index.get(rec.chrom, [])
-        candidates: list[Candidate] = []
-
-        for pc in chains_here:
-            if pc.s_hi <= rec.start or pc.s_lo >= rec.end:
-                continue
-            frags = pc.map_interval(rec.start, rec.end)
-            if not frags:
-                continue
-            covered = sum(f.src_end - f.src_start for f in frags)
-            candidates.append(
-                Candidate(
-                    chain_id=pc.chain_id,
-                    dest_chrom=pc.dest_chrom,
-                    dest_strand=pc.dest_strand,
-                    fragments=frags,
-                    covered=covered,
-                    total=length,
-                )
+        hits, chrom_known = self._seg.candidates_for(rec.chrom, rec.start, rec.end)
+        candidates: list[Candidate] = [
+            Candidate(
+                chain_id=h.pc.chain_id,
+                dest_chrom=h.pc.dest_chrom,
+                dest_strand=h.pc.dest_strand,
+                fragments=[f.to_public() for f in h.fragments],
+                covered=h.covered,
+                total=length,
             )
+            for h in hits
+        ]
 
         if not candidates:
-            if not chains_here:
+            if not chrom_known:
                 row.reason = f"染色体 {rec.chrom} 在 chain 文件的源侧不存在"
             else:
                 row.reason = (

@@ -12,8 +12,13 @@ const STATUS_TEXT = {
 const form = document.getElementById("lift-form");
 const bedInput = document.getElementById("bed");
 const chainInput = document.getElementById("chain");
+const chain2Input = document.getElementById("chain2");
 const bedHint = document.getElementById("bed-hint");
 const chainHint = document.getElementById("chain-hint");
+const chain2Hint = document.getElementById("chain2-hint");
+const doubleFields = document.getElementById("double-fields");
+const chain1Title = document.getElementById("chain1-title");
+const side1Title = document.getElementById("side1-title");
 const submitBtn = document.getElementById("submit-btn");
 const errorBox = document.getElementById("error-box");
 const errorList = document.getElementById("error-list");
@@ -24,17 +29,38 @@ const previewNote = document.getElementById("preview-note");
 const downloadBtn = document.getElementById("download-btn");
 const downloadAdjBtn = document.getElementById("download-adj-btn");
 const decisionNote = document.getElementById("decision-note");
+const twosegNote = document.getElementById("twoseg-note");
+const destTh = document.getElementById("dest-th");
 const actionMsg = document.getElementById("action-msg");
 const filterBtns = document.querySelectorAll(".filter");
 
 let currentToken = null;
 let currentName = null;
 let currentRows = [];
+let currentMode = "single";
 let activeFilter = "all";
 // 裁决状态：{源行号: 候选序号(1基)}；撤销后该键删除
 let decisions = {};
 let resultVersion = 0;
 let decisionPending = false;
+
+function selectedMode() {
+  return form.querySelector('input[name="mode"]:checked').value;
+}
+
+function applyMode() {
+  const dbl = selectedMode() === "double";
+  doubleFields.classList.toggle("hidden", !dbl);
+  chain2Input.required = dbl;
+  chain1Title.textContent = dbl ? "chain 文件 ①（第一段）" : "UCSC chain 文件";
+  side1Title.textContent = dbl
+    ? "第一段：BED 区间属于 chain1 的哪一侧？"
+    : "BED 区间属于 chain 的哪一侧？";
+}
+form.querySelectorAll('input[name="mode"]').forEach((r) => {
+  r.addEventListener("change", applyMode);
+});
+applyMode();
 
 bedInput.addEventListener("change", () => {
   bedHint.textContent = bedInput.files[0]
@@ -44,6 +70,11 @@ bedInput.addEventListener("change", () => {
 chainInput.addEventListener("change", () => {
   chainHint.textContent = chainInput.files[0]
     ? `${chainInput.files[0].name}（${formatSize(chainInput.files[0].size)}）`
+    : "未选择文件";
+});
+chain2Input.addEventListener("change", () => {
+  chain2Hint.textContent = chain2Input.files[0]
+    ? `${chain2Input.files[0].name}（${formatSize(chain2Input.files[0].size)}）`
     : "未选择文件";
 });
 
@@ -59,29 +90,55 @@ form.addEventListener("submit", async (ev) => {
   ev.preventDefault();
   errorBox.classList.add("hidden");
   resultBox.classList.add("hidden");
+
+  const mode = selectedMode();
+  if (mode === "double" && !chain2Input.files[0]) {
+    showErrors(["双段模式需要选择第二份 chain 文件（chain 文件 ②）"]);
+    return;
+  }
+
   submitBtn.disabled = true;
   submitBtn.textContent = "转换中…";
 
   const fd = new FormData();
   fd.append("bed", bedInput.files[0]);
-  fd.append("chain", chainInput.files[0]);
-  fd.append("side", form.querySelector('input[name="side"]:checked').value);
+  let url = "/api/liftover";
+  if (mode === "double") {
+    fd.append("chain1", chainInput.files[0]);
+    fd.append("side1", form.querySelector('input[name="side"]:checked').value);
+    fd.append("chain2", chain2Input.files[0]);
+    fd.append("side2", form.querySelector('input[name="side2"]:checked').value);
+    url = "/api/liftover2";
+  } else {
+    fd.append("chain", chainInput.files[0]);
+    fd.append("side", form.querySelector('input[name="side"]:checked').value);
+  }
 
   try {
-    const resp = await fetch("/api/liftover", { method: "POST", body: fd });
+    const resp = await fetch(url, { method: "POST", body: fd });
     const data = await resp.json();
     if (!resp.ok) {
       showErrors(data.errors || [`请求失败（HTTP ${resp.status}）`]);
       return;
     }
+    currentMode = mode;
     currentToken = data.download_token;
     currentName = data.download_name;
     currentRows = data.preview.rows;
     decisions = {};
     resultVersion = 0;
     renderStats(data.preview);
-    await refreshDecisions();
+    if (currentMode === "single") {
+      await refreshDecisions();
+    }
     renderRows();
+    // 裁决只适用于单段结果；双段结果的多条路径全部保留、不提供裁决版
+    downloadAdjBtn.classList.toggle("hidden", currentMode !== "single");
+    decisionNote.classList.toggle("hidden", currentMode !== "single");
+    twosegNote.classList.toggle("hidden", currentMode !== "double");
+    destTh.textContent = currentMode === "double"
+      ? "路径 / 片段（源 → 中间 → 最终，含两段 chain ID 与每段覆盖）"
+      : "候选 / 片段（目标染色体 · 方向 · 目标区间）";
     resultBox.classList.remove("hidden");
     resultBox.scrollIntoView({ behavior: "smooth", block: "start" });
   } catch (err) {
@@ -242,10 +299,13 @@ function renderRows() {
   tbody.innerHTML = "";
   const rows = currentRows.filter((r) => activeFilter === "all" || r.status === activeFilter);
   const shown = rows.slice(0, PREVIEW_LIMIT);
+  const noteText = currentMode === "double"
+    ? "多路径、多片段在“路径 / 片段”列内分行展开"
+    : "多片段、歧义候选在“候选 / 片段”列内分行展开";
   previewNote.textContent =
     currentRows.length > PREVIEW_LIMIT
       ? `预览仅显示前 ${PREVIEW_LIMIT} 行（当前筛选 ${rows.length} 行 / 共 ${currentRows.length} 行）；下载的 TSV 包含全部结果。`
-      : "共 " + currentRows.length + " 行源区间；多片段、歧义候选在“候选 / 片段”列内分行展开。";
+      : `共 ${currentRows.length} 行源区间；${noteText}。`;
 
   for (const row of shown) {
     const tr = document.createElement("tr");
@@ -263,7 +323,14 @@ function renderRows() {
     badge.className = `badge ${row.status}`;
     badge.textContent = STATUS_TEXT[row.status] || row.status;
     tdStatus.appendChild(badge);
-    if (row.status === "ambiguous") {
+    if (currentMode === "double" && row.failed_stage) {
+      const tag = document.createElement("span");
+      tag.className = "stage-tag";
+      tag.textContent = row.failed_stage === "segment1" ? "失败于第一段" : "失败于第二段";
+      tdStatus.appendChild(document.createElement("br"));
+      tdStatus.appendChild(tag);
+    }
+    if (currentMode === "single" && row.status === "ambiguous") {
       const tag = document.createElement("span");
       const picked = decisions[row.line_no];
       tag.className = `decision-tag ${picked === undefined ? "pending" : "picked"}`;
@@ -273,7 +340,9 @@ function renderRows() {
     }
 
     const tdDest = document.createElement("td");
-    if (row.candidates.length === 0) {
+    if (currentMode === "double") {
+      renderDoubleDestCell(tdDest, row);
+    } else if (row.candidates.length === 0) {
       tdDest.textContent = "—";
     } else if (row.status === "ambiguous") {
       const picked = decisions[row.line_no];
@@ -361,6 +430,37 @@ function renderRows() {
 
     tr.append(tdLine, tdSrc, tdStatus, tdDest, tdReason);
     tbody.appendChild(tr);
+  }
+}
+
+function renderDoubleDestCell(tdDest, row) {
+  if (!row.candidates.length) {
+    tdDest.textContent = "—";
+    return;
+  }
+  for (const p of row.candidates) {
+    const div = document.createElement("div");
+    div.className = "cand";
+
+    const head = document.createElement("div");
+    head.className = "cand-head";
+    head.textContent =
+      `路径 ${p.path_index}/${row.candidates.length} · ` +
+      `chain ${p.chain_id_1} → chain ${p.chain_id_2} · ` +
+      `覆盖 段1 ${p.covered1}/${p.total} bp · 段2 ${p.covered2}/${p.total} bp`;
+    div.appendChild(head);
+
+    p.fragments.forEach((f, fi) => {
+      const fl = document.createElement("div");
+      fl.className = "frag-line";
+      const prefix = p.fragments.length > 1 ? `片段${fi + 1} ` : "";
+      fl.textContent =
+        `${prefix}源 ${f.src_start}-${f.src_end} → ` +
+        `中间 ${p.mid_chrom}:${f.mid_start}-${f.mid_end} (${p.mid_strand}) → ` +
+        `最终 ${p.dest_chrom}:${f.dest_start}-${f.dest_end} (${p.dest_strand})`;
+      div.appendChild(fl);
+    });
+    tdDest.appendChild(div);
   }
 }
 

@@ -1,0 +1,16 @@
+# 双段示例的第二份 chain 文件（配合 demo.chain 使用，非真实物种数据）
+#
+# chain 10: chrA(target) -> chrM(query)，正链，2 个对齐块
+#   target 块: [100,220) [223,493)
+#   query  块: [0,120)   [123,393)
+#   注意 chrA [0,100) 不在本 chain 覆盖内（用于演示“失败于第二段”）
+chain 500 chrA 500 + 100 493 chrM 600 + 0 393 10
+120	3	3
+270
+
+# chain 11: chrB(target) -> chrN(query)，query 为负链
+#   target 块 [200,300)；query 存储帧 [50,150)、负链（chrN 长 400），
+#   归一化到正向帧 [250,350)，块内反向映射：
+#   chrB [240,280) -> chrN [270,310)
+chain 300 chrB 300 + 200 300 chrN 400 - 50 150 11
+100

@@ -27,6 +27,7 @@ from dataclasses import asdict
 from typing import Any, Mapping
 
 from .engine import Candidate, Fragment, RowResult
+from .twoseg import PathCandidate, FinalFragment, TwoSegRowResult
 
 STATUS_LABELS = {
     "mapped": "mapped",
@@ -60,6 +61,35 @@ ADJ_TSV_HEADER = TSV_HEADER + [DECISION_HEADER]
 DECISION_PICKED = "已裁决"
 DECISION_PENDING = "未裁决"
 DECISION_NA = "."
+
+# 双段结果 TSV 列：标明两段 chain ID、路径序号与每段覆盖情况；
+# 最终片段同时给出回溯后的源坐标、中间坐标与最终坐标。
+TWOSEG_TSV_HEADER = [
+    "source_line",
+    "status",
+    "source_chrom",
+    "source_start",
+    "source_end",
+    "path_index",
+    "chain_id_seg1",
+    "chain_id_seg2",
+    "mid_chrom",
+    "mid_strand",
+    "dest_chrom",
+    "dest_strand",
+    "covered_seg1_bp",
+    "covered_seg2_bp",
+    "source_len",
+    "fragment_index",
+    "src_start",
+    "src_end",
+    "mid_start",
+    "mid_end",
+    "dest_start",
+    "dest_end",
+    "failed_stage",
+    "reason",
+]
 
 
 def _fragment_values(
@@ -142,6 +172,50 @@ def build_adjudicated_tsv(
                 for fi, frag in enumerate(cand.fragments, start=1):
                     values = _fragment_values(row, cand, ci, frag, fi)
                     writer.writerow(values + [decision])
+    return buf.getvalue()
+
+
+def _twoseg_fragment_values(
+    row: TwoSegRowResult,
+    path: PathCandidate,
+    frag: FinalFragment,
+    fi: int,
+) -> list[Any]:
+    return [
+        row.line_no, row.status, row.src_chrom, row.src_start, row.src_end,
+        path.path_index, path.chain_id_1, path.chain_id_2,
+        path.mid_chrom, path.mid_strand, path.dest_chrom, path.dest_strand,
+        path.covered1, path.covered2, path.total,
+        fi, frag.src_start, frag.src_end,
+        frag.mid_start, frag.mid_end, frag.dest_start, frag.dest_end,
+        ".", row.reason,
+    ]
+
+
+def build_tsv_twoseg(rows: list[TwoSegRowResult]) -> str:
+    """双段结果 TSV。
+
+    每个源行号可能对应多行（多条路径 × 多个片段）。unmapped 行没有
+    路径，路径/片段列写 '.'，``failed_stage`` 列标明失败阶段
+    （segment1 / segment2），其余行该列写 '.'。
+    """
+    buf = io.StringIO(newline="")
+    writer = csv.writer(buf, delimiter="\t", lineterminator="\n",
+                        quoting=csv.QUOTE_MINIMAL)
+    writer.writerow(TWOSEG_TSV_HEADER)
+    for row in rows:
+        if not row.candidates:
+            writer.writerow([
+                row.line_no, row.status, row.src_chrom, row.src_start, row.src_end,
+                ".", ".", ".", ".", ".", ".", ".", ".", ".",
+                row.src_end - row.src_start,
+                ".", ".", ".", ".", ".", ".", ".",
+                row.failed_stage or ".", row.reason,
+            ])
+            continue
+        for path in row.candidates:
+            for fi, frag in enumerate(path.fragments, start=1):
+                writer.writerow(_twoseg_fragment_values(row, path, frag, fi))
     return buf.getvalue()
 
 

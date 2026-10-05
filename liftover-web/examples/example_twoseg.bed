@@ -1,0 +1,11 @@
+# 双段迁移示例：chain1 = demo.chain（target 侧），chain2 = demo2.chain（target 侧）
+# 行7:  完全映射 chr1:56-176 -> chrA:100-220 -> chrM:0-120
+# 行8:  部分映射 第一段缺口丢失 9 bp（50-56、176-179），其余 126 bp 经两段到达 chrM
+# 行9:  歧义 320-360 两条可达路径：chain 1→10（chrM +）与 chain 2→11（chrN 负链），全部保留
+# 行10: 无映射（失败于第二段）0-16 -> chrA:0-16 不在 chain2 覆盖范围内
+# 行11: 无映射（失败于第一段）chr9 不在 chain1 源侧
+chr1	56	176
+chr1	50	185
+chr1	320	360
+chr1	0	16
+chr9	0	10

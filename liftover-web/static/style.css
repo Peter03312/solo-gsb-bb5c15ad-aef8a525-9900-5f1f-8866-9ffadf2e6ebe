@@ -112,6 +112,17 @@ button.secondary { background: #fff; color: var(--accent); }
 .decision-tag.pending { background: var(--ambiguous-bg); color: var(--ambiguous); }
 .decision-tag.picked { background: #e7e2f6; color: #5b3c99; }
 
+.stage-tag {
+  display: inline-block; margin-top: 4px; padding: 1px 8px; border-radius: 999px;
+  font-size: 11.5px; font-weight: 600; white-space: nowrap;
+  background: var(--unmapped-bg); color: var(--unmapped);
+}
+
+.twoseg-note {
+  font-size: 13px; color: var(--ink); background: #eef6f8;
+  border: 1px solid #cfe3e9; border-radius: 8px; padding: 9px 13px; margin: 12px 0 4px;
+}
+
 .decision-box { display: flex; flex-direction: column; gap: 6px; }
 .decision-cand {
   border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; margin: 0;

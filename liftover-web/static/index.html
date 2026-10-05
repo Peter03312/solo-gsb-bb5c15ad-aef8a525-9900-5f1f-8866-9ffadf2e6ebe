@@ -10,12 +10,22 @@
 <body>
 <header>
   <h1>离线基因组区间迁移</h1>
-  <p class="sub">上传 BED 与 UCSC chain 文件，在浏览器中预览每条源区间的转换状态后下载结果。全程离线，数据不离开本机服务。</p>
+  <p class="sub">上传 BED 与 UCSC chain 文件（单段一份，或双段两份依次迁移），在浏览器中预览每条源区间的转换状态后下载结果。全程离线，数据不离开本机服务。</p>
 </header>
 
 <main>
   <section class="card">
     <form id="lift-form">
+      <div class="form-row side-row">
+        <span class="file-title">转换模式</span>
+        <label class="radio">
+          <input type="radio" name="mode" value="single" checked> 单段（一份 chain）
+        </label>
+        <label class="radio">
+          <input type="radio" name="mode" value="double"> 双段（两份 chain 依次迁移）
+        </label>
+      </div>
+
       <div class="form-row">
         <label class="file-box">
           <span class="file-title">BED 文件（零基左闭右开）</span>
@@ -23,20 +33,40 @@
           <span class="file-hint" id="bed-hint">未选择文件</span>
         </label>
         <label class="file-box">
-          <span class="file-title">UCSC chain 文件</span>
+          <span class="file-title" id="chain1-title">UCSC chain 文件</span>
           <input type="file" id="chain" name="chain" accept=".chain,.txt,text/plain" required>
           <span class="file-hint" id="chain-hint">未选择文件</span>
         </label>
       </div>
 
       <div class="form-row side-row">
-        <span class="file-title">BED 区间属于 chain 的哪一侧？</span>
+        <span class="file-title" id="side1-title">BED 区间属于 chain 的哪一侧？</span>
         <label class="radio">
           <input type="radio" name="side" value="target" checked> target 侧（target → query）
         </label>
         <label class="radio">
           <input type="radio" name="side" value="query"> query 侧（query → target）
         </label>
+      </div>
+
+      <div id="double-fields" class="hidden">
+        <div class="form-row">
+          <label class="file-box">
+            <span class="file-title">chain 文件 ②（第二段）</span>
+            <input type="file" id="chain2" name="chain2" accept=".chain,.txt,text/plain">
+            <span class="file-hint" id="chain2-hint">未选择文件</span>
+          </label>
+        </div>
+
+        <div class="form-row side-row">
+          <span class="file-title">第二段：第一段映射到的中间坐标属于 chain2 的哪一侧？</span>
+          <label class="radio">
+            <input type="radio" name="side2" value="target" checked> target 侧（target → query）
+          </label>
+          <label class="radio">
+            <input type="radio" name="side2" value="query"> query 侧（query → target）
+          </label>
+        </div>
       </div>
 
       <div class="form-row">
@@ -64,6 +94,11 @@
     <div class="stats" id="stats"></div>
 
     <p class="decision-note" id="decision-note"></p>
+    <p class="twoseg-note hidden" id="twoseg-note">
+      双段结果：每条路径标明两段 chain ID、路径序号与每段覆盖（bp）；
+      片段按「源 → 中间 → 最终」坐标展开，源坐标已按映射方向回溯到原 BED 区间。
+      多条可达路径全部保留（歧义），不自动选择或合并；双段结果不提供裁决版下载。
+    </p>
 
     <div class="filters" id="filters">
       <span>筛选：</span>
@@ -84,7 +119,7 @@
             <th>源行号</th>
             <th>源区间</th>
             <th>状态</th>
-            <th>候选 / 片段（目标染色体 · 方向 · 目标区间）</th>
+            <th id="dest-th">候选 / 片段（目标染色体 · 方向 · 目标区间）</th>
             <th>说明</th>
           </tr>
         </thead>

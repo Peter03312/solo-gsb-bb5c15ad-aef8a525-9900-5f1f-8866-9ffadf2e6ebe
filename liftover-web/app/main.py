@@ -3,12 +3,18 @@
 结果只在校验完全通过后保存在进程内存中（BytesIO 等价物），
 任何解析错误都直接 400 返回，不创建、更不提供任何可下载文件。
 
-歧义裁决只作用于某一次转换结果（token 标识），绝不回写原始转换：
+- ``POST /api/liftover``：单段转换（一份 chain）；
+- ``POST /api/liftover2``：双段转换（两份 chain 依次迁移，第二段只处理
+  第一段实际映射到的片段，最终片段回溯到原 BED 源坐标）。
+
+歧义裁决只作用于某一次单段转换结果（token 标识），绝不回写原始转换：
 
 - 原始结果 ``GET /api/download/{token}`` 的字节内容在裁决前后完全一致；
 - 裁决状态（选了哪个候选）带版本号做乐观并发控制，相同版本的并发
   修改只有一次能成功；
 - 裁决版 TSV 由 ``GET /api/download/{token}/adjudicated`` 单独导出。
+
+双段结果的多条可达路径全部保留在原始结果中，不提供裁决接口。
 """
 
 from __future__ import annotations
@@ -27,7 +33,8 @@ from .bed import parse_bed
 from .chain import parse_chain
 from .engine import RowResult
 from .engine import LiftOverEngine
-from .report import build_adjudicated_tsv, build_tsv, rows_to_preview
+from .report import build_adjudicated_tsv, build_tsv, build_tsv_twoseg, rows_to_preview
+from .twoseg import TwoSegmentEngine
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "..", "static")
@@ -41,10 +48,11 @@ app = FastAPI(title="离线基因组区间迁移 (BED liftover)", version="1.1.0
 
 @dataclass
 class _Job:
-    rows: list[RowResult]
+    rows: list                    # 单段为 list[RowResult]，双段为 list[TwoSegRowResult]
     tsv_bytes: bytes               # 原始结果（永不改变）
     filename: str
     created_at: float
+    kind: str = "single"           # single / double（双段结果不支持裁决接口）
     # 裁决状态：{源物理行号: 1 基候选序号}；撤销即删除键
     decisions: dict[int, int] = field(default_factory=dict)
     version: int = 0               # 每次成功修改递增
@@ -138,6 +146,64 @@ async def liftover(
     return {"download_token": token, "download_name": filename, "preview": preview}
 
 
+@app.post("/api/liftover2")
+async def liftover2(
+    bed: UploadFile = File(...),
+    chain1: UploadFile = File(...),
+    side1: str = Form(...),
+    chain2: UploadFile = File(...),
+    side2: str = Form(...),
+):
+    """双段迁移：同一 BED 依次经过 chain1、chain2 两份 chain。
+
+    ``side1`` 是 BED 区间在 chain1 中的源侧；``side2`` 是第一段映射到的
+    中间坐标在 chain2 中的源侧。任一文件格式错误都带行号整体拒绝，
+    不产生任何可下载结果。
+    """
+    for name, side in (("side1", side1), ("side2", side2)):
+        if side not in ("target", "query"):
+            raise HTTPException(status_code=400,
+                                detail={"errors": [f"{name} 必须是 target 或 query"]})
+
+    bed_text = _read_upload(bed)
+    chain1_text = _read_upload(chain1)
+    chain2_text = _read_upload(chain2)
+
+    bed_result = parse_bed(bed_text)
+    chain1_result = parse_chain(chain1_text)
+    chain2_result = parse_chain(chain2_text)
+
+    # 两份 chain 的错误分别标注文件来源，行号保持解析器给出的物理行号
+    errors = (
+        list(bed_result.errors)
+        + [f"chain1 文件：{e}" for e in chain1_result.errors]
+        + [f"chain2 文件：{e}" for e in chain2_result.errors]
+    )
+    if errors:
+        # 校验失败：只返回错误，绝不写入 _jobs —— 不存在可下载文件
+        raise HTTPException(status_code=400, detail={"errors": errors})
+
+    engine = TwoSegmentEngine(
+        chain1_result.chains, side1, chain2_result.chains, side2
+    )
+    rows = engine.convert_all(bed_result.records)
+    preview = rows_to_preview(rows)
+
+    tsv = build_tsv_twoseg(rows)
+    # Excel 友好的 UTF-8 BOM；HTTP 下载本质上仍是内存字节，不落盘
+    payload = b"\xef\xbb\xbf" + tsv.encode("utf-8")
+    token = secrets.token_urlsafe(24)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    filename = f"liftover_twoseg_{stamp}.tsv"
+    _prune_jobs()
+    _jobs[token] = _Job(
+        rows=rows, tsv_bytes=payload, filename=filename,
+        created_at=time.time(), kind="double",
+    )
+
+    return {"download_token": token, "download_name": filename, "preview": preview}
+
+
 def _get_job_or_404(token: str) -> _Job:
     _prune_jobs()
     job = _jobs.get(token)
@@ -145,6 +211,18 @@ def _get_job_or_404(token: str) -> _Job:
         raise HTTPException(
             status_code=404,
             detail={"errors": ["结果不存在或已过期，请重新提交转换"]},
+        )
+    return job
+
+
+def _get_single_job(token: str) -> _Job:
+    """裁决接口只适用于单段结果；双段结果的歧义路径全部保留、不做裁决。"""
+    job = _get_job_or_404(token)
+    if job.kind != "single":
+        raise HTTPException(
+            status_code=400,
+            detail={"errors": ["双段转换结果不支持歧义裁决接口；"
+                               "其多条可达路径已全部保留在原始结果中"]},
         )
     return job
 
@@ -167,7 +245,7 @@ async def download(token: str) -> Response:
 @app.get("/api/result/{token}/decisions")
 async def list_decisions(token: str) -> dict:
     """查看某次结果当前的歧义裁决选择与结果版本。"""
-    job = _get_job_or_404(token)
+    job = _get_single_job(token)
     ambiguous = _ambiguous_line_map(job)
     return {
         "download_token": token,
@@ -234,7 +312,7 @@ async def submit_decisions(token: str, request: Request) -> dict:
             detail={"errors": ["candidate_index 必须是正整数或 null"]},
         )
 
-    job = _get_job_or_404(token)
+    job = _get_single_job(token)
 
     async with job.lock:
         if version != job.version:
@@ -305,7 +383,7 @@ async def download_adjudicated(token: str) -> Response:
     已选歧义行仅输出被选候选的全部片段；未选歧义行输出全部候选并标明
     “未裁决”；其他状态行照原结果输出。原始 status 列保持不变。
     """
-    job = _get_job_or_404(token)
+    job = _get_single_job(token)
     text = build_adjudicated_tsv(job.rows, job.decisions)
     payload = b"\xef\xbb\xbf" + text.encode("utf-8")
     filename = _adjudicated_name(job.filename, job.version)
